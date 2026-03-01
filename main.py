@@ -6,12 +6,14 @@ import datetime as dt
 import re
 import sys
 import time
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
 DEFAULT_INVOICE_DIR = Path(
     r"C:\Users\ver0016\OneDrive - Hoppers Crossing Secondary College\Desktop\Study Work\Invoices"
+    r"C:\Users\ver0016\OneDrive - Hoppers Crossing Secondary College\Desktop\Study Work\Invoices\New invoices"
 )
 
 
@@ -47,6 +49,10 @@ INVOICE_RULES: dict[str, InvoiceConfig] = {
 
 # Keep support for spelling variant requested in prior notes.
 CUSTOMER_ALIASES = {"Advel": "Adeval"}
+# Allow "Advel" typo as requested while still targeting Adeval files.
+CUSTOMER_ALIASES = {
+    "Advel": "Adeval",
+}
 
 REQUIRED_TEMPLATE_FILES = [
     "AFLO Feb.docx",
@@ -66,6 +72,7 @@ def load_document(docx_path: Path):
             "Missing dependency 'python-docx'. Install with: pip install python-docx"
         ) from exc
     return Document(str(docx_path))
+
 
 
 def first_weekday_of_month(year: int, month: int, target_weekday: int) -> dt.date:
@@ -191,6 +198,8 @@ def update_labelled_date(document, label: str, new_date: dt.date) -> None:
         return
 
     new_text = new_date.strftime("%d/%m/%y")
+    new_text = new_date.strftime("%d/%m/%y")
+
     match = re.search(r"\d{1,2}/\d{1,2}/\d{2}", paragraph.text)
     if match:
         replace_text_in_runs(paragraph, match.group(0), new_text)
@@ -217,6 +226,8 @@ def update_description(document, month_name: str) -> None:
         return
 
     original_desc = text[content_start + 1 :].strip()
+    content_start += 1
+    original_desc = text[content_start:].strip()
     updated_desc = replace_first_word_with_month(original_desc, month_name)
     if original_desc and original_desc != updated_desc:
         replace_text_in_runs(paragraph, original_desc, updated_desc)
@@ -260,6 +271,8 @@ def set_service_dates(table, service_dates: list[dt.date]) -> float:
 
 
 def update_gst_and_total(document, subtotal: float) -> None:
+    total_value = subtotal
+
     for table in document.tables:
         for row in table.rows:
             for idx, cell in enumerate(row.cells):
