@@ -4,12 +4,15 @@ import argparse
 import calendar
 import datetime as dt
 import re
+import sys
+import time
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
 DEFAULT_INVOICE_DIR = Path(
+    r"C:\Users\ver0016\OneDrive - Hoppers Crossing Secondary College\Desktop\Study Work\Invoices"
     r"C:\Users\ver0016\OneDrive - Hoppers Crossing Secondary College\Desktop\Study Work\Invoices\New invoices"
 )
 
@@ -19,6 +22,18 @@ class InvoiceConfig:
     key: str
     display_name: str
     weekdays: tuple[int, ...]
+
+
+@dataclass
+class ProcessResult:
+    source_name: str
+    docx_name: str
+    pdf_name: str
+    invoice_number: str
+    subtotal: float
+    status: str
+    duration_s: float
+    error: str = ""
 
 
 INVOICE_RULES: dict[str, InvoiceConfig] = {
@@ -32,6 +47,8 @@ INVOICE_RULES: dict[str, InvoiceConfig] = {
     "Rodpak": InvoiceConfig(key="Rodpak", display_name="Rodpak", weekdays=(calendar.SUNDAY,)),
 }
 
+# Keep support for spelling variant requested in prior notes.
+CUSTOMER_ALIASES = {"Advel": "Adeval"}
 # Allow "Advel" typo as requested while still targeting Adeval files.
 CUSTOMER_ALIASES = {
     "Advel": "Adeval",
@@ -179,6 +196,8 @@ def update_labelled_date(document, label: str, new_date: dt.date) -> None:
     paragraph = find_line_with_label(document, label)
     if not paragraph:
         return
+
+    new_text = new_date.strftime("%d/%m/%y")
     new_text = new_date.strftime("%d/%m/%y")
 
     match = re.search(r"\d{1,2}/\d{1,2}/\d{2}", paragraph.text)
@@ -196,6 +215,7 @@ def update_description(document, month_name: str) -> None:
     paragraph = find_line_with_label(document, "description")
     if not paragraph:
         return
+
     text = paragraph.text
     idx = text.lower().find("description")
     if idx == -1:
@@ -204,6 +224,8 @@ def update_description(document, month_name: str) -> None:
     content_start = text.find(":", idx)
     if content_start == -1:
         return
+
+    original_desc = text[content_start + 1 :].strip()
     content_start += 1
     original_desc = text[content_start:].strip()
     updated_desc = replace_first_word_with_month(original_desc, month_name)
@@ -258,7 +280,7 @@ def update_gst_and_total(document, subtotal: float) -> None:
                 if label == "gst" and idx + 1 < len(row.cells):
                     row.cells[idx + 1].text = "$0"
                 if label == "total" and idx + 1 < len(row.cells):
-                    row.cells[idx + 1].text = format_money(total_value)
+                    row.cells[idx + 1].text = format_money(subtotal)
 
 
 def convert_to_pdf(docx_path: Path, pdf_path: Path) -> None:
@@ -288,9 +310,7 @@ def convert_to_pdf(docx_path: Path, pdf_path: Path) -> None:
 
 def target_names_for_month(source_path: Path, month_abbrev: str) -> tuple[Path, Path]:
     new_stem = source_path.stem.replace(MONTH_TOKEN, month_abbrev)
-    docx_target = source_path.with_name(f"{new_stem}.docx")
-    pdf_target = source_path.with_name(f"{new_stem}.pdf")
-    return docx_target, pdf_target
+    return source_path.with_name(f"{new_stem}.docx"), source_path.with_name(f"{new_stem}.pdf")
 
 
 def resolve_invoice_files(base_dir: Path) -> list[Path]:
@@ -305,15 +325,15 @@ def resolve_invoice_files(base_dir: Path) -> list[Path]:
             missing.append(name)
 
     if missing:
-        missing_text = ", ".join(missing)
         raise SystemExit(
-            f"Missing required invoice templates in {base_dir}: {missing_text}."
+            f"Missing required invoice templates in {base_dir}: {', '.join(missing)}."
         )
 
     return files
 
 
-def process_invoice(source_doc: Path, year: int, month: int, dry_run: bool = False) -> tuple[Path, Path]:
+def process_invoice(source_doc: Path, year: int, month: int, dry_run: bool = False) -> ProcessResult:
+    start = time.perf_counter()
     customer_key = find_customer_key(source_doc.name)
     if not customer_key:
         raise RuntimeError(f"Unknown customer key in filename: {source_doc.name}")
@@ -328,39 +348,72 @@ def process_invoice(source_doc: Path, year: int, month: int, dry_run: bool = Fal
     docx_target, pdf_target = target_names_for_month(source_doc, month_abbrev)
 
     if dry_run:
-        return docx_target, pdf_target
+        return ProcessResult(
+            source_name=source_doc.name,
+            docx_name=docx_target.name,
+            pdf_name=pdf_target.name,
+            invoice_number="",
+            subtotal=0.0,
+            status="planned",
+            duration_s=time.perf_counter() - start,
+        )
 
-    working_copy = source_doc.with_name(f"{source_doc.stem}__tmp_working.docx")
-    shutil.copy2(source_doc, working_copy)
+    document = load_document(source_doc)
+    update_labelled_date(document, "date", invoice_date)
+    update_labelled_date(document, "due date", due_date)
+    new_invoice_number = update_invoice_number(document)
+    update_description(document, month_name)
 
-    try:
-        document = load_document(working_copy)
-        update_labelled_date(document, "date", invoice_date)
-        update_labelled_date(document, "due date", due_date)
-        update_invoice_number(document)
-        update_description(document, month_name)
+    service_table = find_service_table(document)
+    subtotal = 0.0
+    if service_table:
+        subtotal = set_service_dates(service_table, service_dates)
+    update_gst_and_total(document, subtotal)
 
-        service_table = find_service_table(document)
-        subtotal = 0.0
-        if service_table:
-            subtotal = set_service_dates(service_table, service_dates)
-        update_gst_and_total(document, subtotal)
+    document.save(str(docx_target))
+    convert_to_pdf(docx_target, pdf_target)
 
-        document.save(str(docx_target))
-        convert_to_pdf(docx_target, pdf_target)
-    finally:
-        working_copy.unlink(missing_ok=True)
-
-    return docx_target, pdf_target
+    return ProcessResult(
+        source_name=source_doc.name,
+        docx_name=docx_target.name,
+        pdf_name=pdf_target.name,
+        invoice_number=new_invoice_number,
+        subtotal=subtotal,
+        status="created",
+        duration_s=time.perf_counter() - start,
+    )
 
 
 def print_banner(year: int, month: int, invoice_dir: Path, dry_run: bool) -> None:
     month_name = dt.date(year, month, 1).strftime("%B")
     mode = "DRY RUN" if dry_run else "LIVE"
-    print("=" * 72)
-    print(f" Invoice Generator | {month_name} {year} | Mode: {mode}")
-    print(f" Folder: {invoice_dir}")
-    print("=" * 72)
+    print("=" * 82)
+    print(f" 📄 Invoice Generator | {month_name} {year} | Mode: {mode}")
+    print(f" 📁 Folder: {invoice_dir}")
+    print("=" * 82)
+
+
+def print_result(index: int, total: int, result: ProcessResult) -> None:
+    icon = "✅" if result.status in {"created", "planned"} else "❌"
+    print(f"[{index}/{total}] {icon} {result.source_name}")
+    if result.status == "planned":
+        print(f"    • Plan: {result.docx_name} + {result.pdf_name}")
+    else:
+        invoice_text = result.invoice_number if result.invoice_number else "(unchanged)"
+        print(
+            f"    • Output: {result.docx_name} + {result.pdf_name} | "
+            f"Invoice#: {invoice_text} | Total: {format_money(result.subtotal)} | "
+            f"{result.duration_s:.2f}s"
+        )
+
+
+def maybe_pause(pause_on_exit: bool) -> None:
+    if not pause_on_exit:
+        return
+    try:
+        input("\nPress Enter to close...")
+    except EOFError:
+        pass
 
 
 def main() -> None:
@@ -388,7 +441,12 @@ def main() -> None:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print planned output without writing files.",
+        help="Preview output names without writing files.",
+    )
+    parser.add_argument(
+        "--pause-on-exit",
+        action="store_true",
+        help="Pause at end so the window does not close immediately.",
     )
 
     args = parser.parse_args()
@@ -396,6 +454,7 @@ def main() -> None:
     if not 1 <= args.month <= 12:
         raise SystemExit("Month must be between 1 and 12")
 
+    run_start = time.perf_counter()
     invoice_files = resolve_invoice_files(args.invoice_dir)
     print_banner(args.year, args.month, args.invoice_dir, args.dry_run)
 
@@ -403,33 +462,38 @@ def main() -> None:
     failures = 0
 
     for index, source_doc in enumerate(invoice_files, start=1):
-        print(f"[{index}/{len(invoice_files)}] Processing {source_doc.name} ...")
         try:
-            docx_target, pdf_target = process_invoice(
-                source_doc,
-                args.year,
-                args.month,
-                dry_run=args.dry_run,
-            )
-            if args.dry_run:
-                print(
-                    f"   ✅ Planned -> DOCX: {docx_target.name} | PDF: {pdf_target.name}"
-                )
-            else:
-                print(f"   ✅ Created -> DOCX: {docx_target.name} | PDF: {pdf_target.name}")
+            result = process_invoice(source_doc, args.year, args.month, dry_run=args.dry_run)
+            print_result(index, len(invoice_files), result)
             completed += 1
         except Exception as exc:  # pragma: no cover - runtime env specific
-            print(f"   ❌ Failed -> {source_doc.name}: {exc}")
             failures += 1
+            print(f"[{index}/{len(invoice_files)}] ❌ {source_doc.name}")
+            print(f"    • Error: {exc}")
 
-    print("-" * 72)
+    elapsed = time.perf_counter() - run_start
+    print("-" * 82)
     print(
-        f"Finished: {completed} succeeded, {failures} failed, total {len(invoice_files)} invoice(s)."
+        f"Done: {completed} succeeded, {failures} failed, total {len(invoice_files)} invoice(s) "
+        f"in {elapsed:.2f}s"
     )
 
     if failures:
+        maybe_pause(args.pause_on_exit)
         raise SystemExit(1)
+
+    maybe_pause(args.pause_on_exit)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as uncaught_error:
+        print(f"\n❌ Fatal error: {uncaught_error}")
+        # Keep output visible when launched by double-click in Windows.
+        if "--pause-on-exit" in sys.argv:
+            try:
+                input("Press Enter to close...")
+            except EOFError:
+                pass
+        raise
