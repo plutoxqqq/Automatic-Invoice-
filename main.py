@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 DEFAULT_INVOICE_DIR = Path(
-    r"C:\Users\ver0016\OneDrive - Hoppers Crossing Secondary College\Desktop\Study Work\Invoices"
     r"C:\Users\ver0016\OneDrive - Hoppers Crossing Secondary College\Desktop\Study Work\Invoices\New invoices"
 )
 
