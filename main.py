@@ -13,6 +13,7 @@ from typing import Iterable, Optional
 DEFAULT_INVOICE_DIR = Path(
     r"C:\Users\ver0016\OneDrive - Hoppers Crossing Secondary College\Desktop\Study Work\Invoices"
 )
+DEFAULT_OUTPUT_SUBFOLDER = "new invoice"
 
 
 @dataclass(frozen=True)
@@ -48,15 +49,14 @@ INVOICE_RULES: dict[str, InvoiceConfig] = {
 # Keep support for spelling variant requested in prior notes.
 CUSTOMER_ALIASES = {"Advel": "Adeval"}
 
-REQUIRED_TEMPLATE_FILES = [
-    "AFLO Feb.docx",
-    "Bensons Feb.docx",
-    "Adeval Feb.docx",
-    "Rodpak Feb.docx",
-]
+TEMPLATE_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "AFLO": ("AFLO Feb.docx",),
+    "Bensons": ("Bensons Feb.docx",),
+    "Adeval": ("Adeval Feb.docx", "Advel Feb.docx"),
+    "Rodpak": ("Rodpak Feb.docx", "Rodpak Feb.doxc"),
+}
 
 MONTH_TOKEN = "Feb"
-
 
 MONTH_NAME_TO_NUMBER = {
     "jan": 1,
@@ -100,18 +100,19 @@ def parse_month_input(value: str) -> int:
     if normalized in MONTH_NAME_TO_NUMBER:
         return MONTH_NAME_TO_NUMBER[normalized]
 
-    raise ValueError(
-        "Unknown month. Use jan/january ... dec/december (or a number 1-12)."
-    )
+    raise ValueError("Unknown month. Use jan/january ... dec/december (or a number 1-12).")
 
 
 def prompt_for_month(default_month: int) -> int:
     default_name = dt.date(2000, default_month, 1).strftime("%B")
     while True:
-        answer = input(
-            f"Which month do you want to generate invoices for? "
-            f"(e.g. april/apr/4) [default: {default_name}]: "
-        ).strip()
+        try:
+            answer = input(
+                f"Which month do you want to generate invoices for? "
+                f"(e.g. april/apr/4) [default: {default_name}]: "
+            ).strip()
+        except EOFError:
+            return default_month
         if not answer:
             return default_month
         try:
@@ -120,14 +121,11 @@ def prompt_for_month(default_month: int) -> int:
             print(f"⚠️ {exc}")
 
 
-
 def load_document(docx_path: Path):
     try:
         from docx import Document
     except ImportError as exc:  # pragma: no cover - import guard
-        raise SystemExit(
-            "Missing dependency 'python-docx'. Install with: pip install python-docx"
-        ) from exc
+        raise SystemExit("Missing dependency 'python-docx'. Install with: pip install python-docx") from exc
     return Document(str(docx_path))
 
 
@@ -358,31 +356,46 @@ def convert_to_pdf(docx_path: Path, pdf_path: Path) -> None:
         ) from exc
 
 
-def target_names_for_month(source_path: Path, month_abbrev: str) -> tuple[Path, Path]:
+def target_names_for_month(source_path: Path, month_abbrev: str, output_dir: Path) -> tuple[Path, Path]:
     new_stem = source_path.stem.replace(MONTH_TOKEN, month_abbrev)
-    return source_path.with_name(f"{new_stem}.docx"), source_path.with_name(f"{new_stem}.pdf")
+    return output_dir / f"{new_stem}.docx", output_dir / f"{new_stem}.pdf"
 
 
 def resolve_invoice_files(base_dir: Path) -> list[Path]:
     files: list[Path] = []
-    missing: list[str] = []
+    missing_messages: list[str] = []
 
-    for name in REQUIRED_TEMPLATE_FILES:
-        candidate = base_dir / name
-        if candidate.exists():
-            files.append(candidate)
+    for company, candidates in TEMPLATE_CANDIDATES.items():
+        selected: Optional[Path] = None
+        for name in candidates:
+            candidate = base_dir / name
+            if candidate.exists():
+                selected = candidate
+                break
+
+        if selected is None:
+            missing_messages.append(f"{company}: one of {', '.join(candidates)}")
         else:
-            missing.append(name)
+            files.append(selected)
 
-    if missing:
+    if missing_messages:
         raise SystemExit(
-            f"Missing required invoice templates in {base_dir}: {', '.join(missing)}."
+            "Missing required invoice templates in "
+            f"{base_dir}: "
+            + " | ".join(missing_messages)
+            + "."
         )
 
     return files
 
 
-def process_invoice(source_doc: Path, year: int, month: int, dry_run: bool = False) -> ProcessResult:
+def process_invoice(
+    source_doc: Path,
+    output_dir: Path,
+    year: int,
+    month: int,
+    dry_run: bool = False,
+) -> ProcessResult:
     start = time.perf_counter()
     customer_key = find_customer_key(source_doc.name)
     if not customer_key:
@@ -394,10 +407,9 @@ def process_invoice(source_doc: Path, year: int, month: int, dry_run: bool = Fal
     service_dates = all_weekdays_in_month(year, month, config.weekdays)
 
     month_abbrev = dt.date(year, month, 1).strftime("%b")
-    month_name = dt.date(year, month, 1).strftime("%B")
     previous_month_date = add_months(dt.date(year, month, 1), -1)
     description_month_name = previous_month_date.strftime("%B")
-    docx_target, pdf_target = target_names_for_month(source_doc, month_abbrev)
+    docx_target, pdf_target = target_names_for_month(source_doc, month_abbrev, output_dir)
 
     if dry_run:
         return ProcessResult(
@@ -422,6 +434,7 @@ def process_invoice(source_doc: Path, year: int, month: int, dry_run: bool = Fal
         subtotal = set_service_dates(service_table, service_dates)
     update_gst_and_total(document, subtotal)
 
+    output_dir.mkdir(parents=True, exist_ok=True)
     document.save(str(docx_target))
     convert_to_pdf(docx_target, pdf_target)
 
@@ -436,18 +449,18 @@ def process_invoice(source_doc: Path, year: int, month: int, dry_run: bool = Fal
     )
 
 
-def print_banner(year: int, month: int, invoice_dir: Path, dry_run: bool) -> None:
+def print_banner(year: int, month: int, invoice_dir: Path, output_dir: Path, dry_run: bool) -> None:
     month_name = dt.date(year, month, 1).strftime("%B")
     mode = "DRY RUN" if dry_run else "LIVE"
-    print("=" * 82)
+    print("=" * 92)
     print(f" 📄 Invoice Generator | {month_name} {year} | Mode: {mode}")
-    print(f" 📁 Folder: {invoice_dir}")
-    print("=" * 82)
+    print(f" 📁 Templates: {invoice_dir}")
+    print(f" 📂 Output:    {output_dir}")
+    print("=" * 92)
 
 
 def print_result(index: int, total: int, result: ProcessResult) -> None:
-    icon = "✅" if result.status in {"created", "planned"} else "❌"
-    print(f"[{index}/{total}] {icon} {result.source_name}")
+    print(f"[{index}/{total}] ✅ {result.source_name}")
     if result.status == "planned":
         print(f"    • Plan: {result.docx_name} + {result.pdf_name}")
     else:
@@ -477,6 +490,12 @@ def main() -> None:
         type=Path,
         default=DEFAULT_INVOICE_DIR,
         help="Directory containing source invoice DOCX files.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Output directory for new files (default: <invoice-dir>/new invoice).",
     )
     parser.add_argument(
         "--year",
@@ -509,10 +528,7 @@ def main() -> None:
     args = parser.parse_args()
 
     default_month = dt.date.today().month
-    if args.ask_month:
-        selected_month = prompt_for_month(default_month)
-    elif args.month is None:
-        # Default behavior requested: ask on CMD when month is not explicitly passed.
+    if args.ask_month or args.month is None:
         selected_month = prompt_for_month(default_month)
     else:
         try:
@@ -520,16 +536,24 @@ def main() -> None:
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
 
+    output_dir = args.output_dir or (args.invoice_dir / DEFAULT_OUTPUT_SUBFOLDER)
+
     run_start = time.perf_counter()
     invoice_files = resolve_invoice_files(args.invoice_dir)
-    print_banner(args.year, selected_month, args.invoice_dir, args.dry_run)
+    print_banner(args.year, selected_month, args.invoice_dir, output_dir, args.dry_run)
 
     completed = 0
     failures = 0
 
     for index, source_doc in enumerate(invoice_files, start=1):
         try:
-            result = process_invoice(source_doc, args.year, selected_month, dry_run=args.dry_run)
+            result = process_invoice(
+                source_doc=source_doc,
+                output_dir=output_dir,
+                year=args.year,
+                month=selected_month,
+                dry_run=args.dry_run,
+            )
             print_result(index, len(invoice_files), result)
             completed += 1
         except Exception as exc:  # pragma: no cover - runtime env specific
@@ -538,7 +562,7 @@ def main() -> None:
             print(f"    • Error: {exc}")
 
     elapsed = time.perf_counter() - run_start
-    print("-" * 82)
+    print("-" * 92)
     print(
         f"Done: {completed} succeeded, {failures} failed, total {len(invoice_files)} invoice(s) "
         f"in {elapsed:.2f}s"
@@ -556,7 +580,6 @@ if __name__ == "__main__":
         main()
     except Exception as uncaught_error:
         print(f"\n❌ Fatal error: {uncaught_error}")
-        # Keep output visible when launched by double-click in Windows.
         if "--pause-on-exit" in sys.argv:
             try:
                 input("Press Enter to close...")
