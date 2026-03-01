@@ -7,15 +7,7 @@ import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional
-
-try:
-    from docx import Document
-except ImportError as exc:  # pragma: no cover - import guard
-    raise SystemExit(
-        "Missing dependency 'python-docx'. Install with: pip install python-docx"
-    ) from exc
-
+from typing import Iterable, Optional
 
 DEFAULT_INVOICE_DIR = Path(
     r"C:\Users\ver0016\OneDrive - Hoppers Crossing Secondary College\Desktop\Study Work\Invoices"
@@ -24,20 +16,46 @@ DEFAULT_INVOICE_DIR = Path(
 
 @dataclass(frozen=True)
 class InvoiceConfig:
-    prefix: str
+    key: str
+    display_name: str
     weekdays: tuple[int, ...]
 
 
 INVOICE_RULES: dict[str, InvoiceConfig] = {
-    "AFLO": InvoiceConfig(prefix="AF", weekdays=(calendar.MONDAY,)),
+    "AFLO": InvoiceConfig(key="AFLO", display_name="AFLO", weekdays=(calendar.MONDAY,)),
     "Bensons": InvoiceConfig(
-        prefix="BE", weekdays=(calendar.WEDNESDAY, calendar.FRIDAY)
+        key="Bensons",
+        display_name="Bensons",
+        weekdays=(calendar.WEDNESDAY, calendar.FRIDAY),
     ),
-    "Adeval": InvoiceConfig(prefix="AD", weekdays=(calendar.FRIDAY,)),
-    "Rodpak": InvoiceConfig(prefix="RO", weekdays=(calendar.SUNDAY,)),
+    "Adeval": InvoiceConfig(key="Adeval", display_name="Adeval", weekdays=(calendar.FRIDAY,)),
+    "Rodpak": InvoiceConfig(key="Rodpak", display_name="Rodpak", weekdays=(calendar.SUNDAY,)),
 }
 
+# Allow "Advel" typo as requested while still targeting Adeval files.
+CUSTOMER_ALIASES = {
+    "Advel": "Adeval",
+}
+
+REQUIRED_TEMPLATE_FILES = [
+    "AFLO Feb.docx",
+    "Bensons Feb.docx",
+    "Adeval Feb.docx",
+    "Rodpak Feb.docx",
+]
+
 MONTH_TOKEN = "Feb"
+
+
+def load_document(docx_path: Path):
+    try:
+        from docx import Document
+    except ImportError as exc:  # pragma: no cover - import guard
+        raise SystemExit(
+            "Missing dependency 'python-docx'. Install with: pip install python-docx"
+        ) from exc
+    return Document(str(docx_path))
+
 
 
 def first_weekday_of_month(year: int, month: int, target_weekday: int) -> dt.date:
@@ -104,12 +122,12 @@ def replace_text_in_runs(paragraph, old: str, new: str) -> bool:
         run.text = replaced[cursor : cursor + run_len]
         cursor += run_len
 
-    if cursor < len(replaced):
+    if cursor < len(replaced) and paragraph.runs:
         paragraph.runs[-1].text += replaced[cursor:]
     return True
 
 
-def iter_all_paragraphs(document: Document):
+def iter_all_paragraphs(document):
     for paragraph in document.paragraphs:
         yield paragraph
     for table in document.tables:
@@ -124,6 +142,9 @@ def find_customer_key(filename: str) -> Optional[str]:
     for key in INVOICE_RULES:
         if stem.lower().startswith(key.lower()):
             return key
+    for alias, real_key in CUSTOMER_ALIASES.items():
+        if stem.lower().startswith(alias.lower()):
+            return real_key
     return None
 
 
@@ -131,7 +152,7 @@ def get_due_date(invoice_date: dt.date) -> dt.date:
     return add_months(invoice_date, 1) + dt.timedelta(days=1)
 
 
-def find_line_with_label(document: Document, label: str):
+def find_line_with_label(document, label: str):
     lower_label = label.lower()
     for paragraph in iter_all_paragraphs(document):
         if lower_label in paragraph.text.lower():
@@ -139,22 +160,22 @@ def find_line_with_label(document: Document, label: str):
     return None
 
 
-def update_invoice_number(document: Document) -> None:
+def update_invoice_number(document) -> str:
     paragraph = find_line_with_label(document, "invoice no")
     if not paragraph:
-        return
+        return ""
 
     match = re.search(r"([A-Za-z]+)(\d+)", paragraph.text)
     if not match:
-        return
+        return ""
 
     prefix, number = match.group(1), match.group(2)
     incremented = f"{prefix}{int(number) + 1:0{len(number)}d}"
-    old = match.group(0)
-    replace_text_in_runs(paragraph, old, incremented)
+    replace_text_in_runs(paragraph, match.group(0), incremented)
+    return incremented
 
 
-def update_labelled_date(document: Document, label: str, new_date: dt.date) -> None:
+def update_labelled_date(document, label: str, new_date: dt.date) -> None:
     paragraph = find_line_with_label(document, label)
     if not paragraph:
         return
@@ -165,15 +186,13 @@ def update_labelled_date(document: Document, label: str, new_date: dt.date) -> N
         replace_text_in_runs(paragraph, match.group(0), new_text)
         return
 
-    # Fallback if date is glued to label, e.g. Date:01/03/26
-    base = paragraph.text
     pattern = re.compile(r"(:\s*)([^\s]+)$")
-    m = pattern.search(base)
-    if m:
-        replace_text_in_runs(paragraph, m.group(2), new_text)
+    fallback_match = pattern.search(paragraph.text)
+    if fallback_match:
+        replace_text_in_runs(paragraph, fallback_match.group(2), new_text)
 
 
-def update_description(document: Document, month_name: str) -> None:
+def update_description(document, month_name: str) -> None:
     paragraph = find_line_with_label(document, "description")
     if not paragraph:
         return
@@ -192,7 +211,7 @@ def update_description(document: Document, month_name: str) -> None:
         replace_text_in_runs(paragraph, original_desc, updated_desc)
 
 
-def find_service_table(document: Document):
+def find_service_table(document):
     for table in document.tables:
         if not table.rows:
             continue
@@ -208,7 +227,7 @@ def duplicate_row(table, row_idx: int):
     table._tbl.append(new_tr)  # pylint: disable=protected-access
 
 
-def set_service_dates(table, service_dates: List[dt.date]) -> float:
+def set_service_dates(table, service_dates: list[dt.date]) -> float:
     existing_data_rows = table.rows[1:]
 
     while len(existing_data_rows) < len(service_dates):
@@ -219,19 +238,18 @@ def set_service_dates(table, service_dates: List[dt.date]) -> float:
         table._tbl.remove(existing_data_rows[-1]._tr)  # pylint: disable=protected-access
         existing_data_rows = table.rows[1:]
 
-    total = 0.0
+    subtotal = 0.0
     for row, service_date in zip(existing_data_rows, service_dates):
         if len(row.cells) < 2:
             continue
         row.cells[0].text = service_date.strftime("%d/%m")
-        total += parse_money(row.cells[1].text)
+        subtotal += parse_money(row.cells[1].text)
 
-    return total
+    return subtotal
 
 
-def update_gst_and_total(document: Document, subtotal: float) -> None:
-    gst_value = 0.0
-    total_value = subtotal + gst_value
+def update_gst_and_total(document, subtotal: float) -> None:
+    total_value = subtotal
 
     for table in document.tables:
         for row in table.rows:
@@ -252,7 +270,6 @@ def convert_to_pdf(docx_path: Path, pdf_path: Path) -> None:
     except ImportError:
         pass
 
-    # Windows-only fallback using Word COM automation if pywin32 is present.
     try:
         import win32com.client  # type: ignore
 
@@ -277,34 +294,29 @@ def target_names_for_month(source_path: Path, month_abbrev: str) -> tuple[Path, 
 
 
 def resolve_invoice_files(base_dir: Path) -> list[Path]:
-    requested = [
-        "AFLO Feb.docx",
-        "Bensons Feb.docx",
-        "Adeval Feb.docx",
-        "Rodpak Feb.docx",
-        "Rodpak Feb.doxc",
-    ]
     files: list[Path] = []
-    for name in requested:
+    missing: list[str] = []
+
+    for name in REQUIRED_TEMPLATE_FILES:
         candidate = base_dir / name
-        if candidate.exists() and candidate.suffix.lower() == ".docx":
+        if candidate.exists():
             files.append(candidate)
-    # Deduplicate while preserving order.
-    unique: list[Path] = []
-    seen: set[str] = set()
-    for file in files:
-        key = file.resolve().as_posix()
-        if key not in seen:
-            unique.append(file)
-            seen.add(key)
-    return unique
+        else:
+            missing.append(name)
+
+    if missing:
+        missing_text = ", ".join(missing)
+        raise SystemExit(
+            f"Missing required invoice templates in {base_dir}: {missing_text}."
+        )
+
+    return files
 
 
-def process_invoice(source_doc: Path, year: int, month: int, dry_run: bool = False) -> None:
+def process_invoice(source_doc: Path, year: int, month: int, dry_run: bool = False) -> tuple[Path, Path]:
     customer_key = find_customer_key(source_doc.name)
     if not customer_key:
-        print(f"Skipping {source_doc.name}: unknown customer key")
-        return
+        raise RuntimeError(f"Unknown customer key in filename: {source_doc.name}")
 
     config = INVOICE_RULES[customer_key]
     invoice_date = first_weekday_of_month(year, month, calendar.SUNDAY)
@@ -313,33 +325,42 @@ def process_invoice(source_doc: Path, year: int, month: int, dry_run: bool = Fal
 
     month_abbrev = dt.date(year, month, 1).strftime("%b")
     month_name = dt.date(year, month, 1).strftime("%B")
-
     docx_target, pdf_target = target_names_for_month(source_doc, month_abbrev)
 
     if dry_run:
-        print(f"[DRY RUN] Would generate {docx_target.name} and {pdf_target.name}")
-        return
+        return docx_target, pdf_target
 
     working_copy = source_doc.with_name(f"{source_doc.stem}__tmp_working.docx")
     shutil.copy2(source_doc, working_copy)
 
-    document = Document(str(working_copy))
-    update_labelled_date(document, "date", invoice_date)
-    update_labelled_date(document, "due date", due_date)
-    update_invoice_number(document)
-    update_description(document, month_name)
+    try:
+        document = load_document(working_copy)
+        update_labelled_date(document, "date", invoice_date)
+        update_labelled_date(document, "due date", due_date)
+        update_invoice_number(document)
+        update_description(document, month_name)
 
-    service_table = find_service_table(document)
-    subtotal = 0.0
-    if service_table:
-        subtotal = set_service_dates(service_table, service_dates)
-    update_gst_and_total(document, subtotal)
+        service_table = find_service_table(document)
+        subtotal = 0.0
+        if service_table:
+            subtotal = set_service_dates(service_table, service_dates)
+        update_gst_and_total(document, subtotal)
 
-    document.save(str(docx_target))
-    convert_to_pdf(docx_target, pdf_target)
+        document.save(str(docx_target))
+        convert_to_pdf(docx_target, pdf_target)
+    finally:
+        working_copy.unlink(missing_ok=True)
 
-    working_copy.unlink(missing_ok=True)
-    print(f"Generated: {docx_target.name} and {pdf_target.name}")
+    return docx_target, pdf_target
+
+
+def print_banner(year: int, month: int, invoice_dir: Path, dry_run: bool) -> None:
+    month_name = dt.date(year, month, 1).strftime("%B")
+    mode = "DRY RUN" if dry_run else "LIVE"
+    print("=" * 72)
+    print(f" Invoice Generator | {month_name} {year} | Mode: {mode}")
+    print(f" Folder: {invoice_dir}")
+    print("=" * 72)
 
 
 def main() -> None:
@@ -376,14 +397,38 @@ def main() -> None:
         raise SystemExit("Month must be between 1 and 12")
 
     invoice_files = resolve_invoice_files(args.invoice_dir)
-    if not invoice_files:
-        raise SystemExit(
-            f"No matching source DOCX files found in {args.invoice_dir}. "
-            "Expected files such as 'AFLO Feb.docx'."
-        )
+    print_banner(args.year, args.month, args.invoice_dir, args.dry_run)
 
-    for source_doc in invoice_files:
-        process_invoice(source_doc, args.year, args.month, dry_run=args.dry_run)
+    completed = 0
+    failures = 0
+
+    for index, source_doc in enumerate(invoice_files, start=1):
+        print(f"[{index}/{len(invoice_files)}] Processing {source_doc.name} ...")
+        try:
+            docx_target, pdf_target = process_invoice(
+                source_doc,
+                args.year,
+                args.month,
+                dry_run=args.dry_run,
+            )
+            if args.dry_run:
+                print(
+                    f"   ✅ Planned -> DOCX: {docx_target.name} | PDF: {pdf_target.name}"
+                )
+            else:
+                print(f"   ✅ Created -> DOCX: {docx_target.name} | PDF: {pdf_target.name}")
+            completed += 1
+        except Exception as exc:  # pragma: no cover - runtime env specific
+            print(f"   ❌ Failed -> {source_doc.name}: {exc}")
+            failures += 1
+
+    print("-" * 72)
+    print(
+        f"Finished: {completed} succeeded, {failures} failed, total {len(invoice_files)} invoice(s)."
+    )
+
+    if failures:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
