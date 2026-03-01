@@ -6,13 +6,12 @@ import datetime as dt
 import re
 import sys
 import time
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
 DEFAULT_INVOICE_DIR = Path(
-    r"C:\Users\ver0016\OneDrive - Hoppers Crossing Secondary College\Desktop\Study Work\Invoices\New invoices"
+    r"C:\Users\ver0016\OneDrive - Hoppers Crossing Secondary College\Desktop\Study Work\Invoices"
 )
 
 
@@ -48,10 +47,6 @@ INVOICE_RULES: dict[str, InvoiceConfig] = {
 
 # Keep support for spelling variant requested in prior notes.
 CUSTOMER_ALIASES = {"Advel": "Adeval"}
-# Allow "Advel" typo as requested while still targeting Adeval files.
-CUSTOMER_ALIASES = {
-    "Advel": "Adeval",
-}
 
 REQUIRED_TEMPLATE_FILES = [
     "AFLO Feb.docx",
@@ -63,6 +58,69 @@ REQUIRED_TEMPLATE_FILES = [
 MONTH_TOKEN = "Feb"
 
 
+MONTH_NAME_TO_NUMBER = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+
+
+def parse_month_input(value: str) -> int:
+    normalized = value.strip().lower()
+    if not normalized:
+        raise ValueError("Month cannot be empty")
+
+    if normalized.isdigit():
+        month = int(normalized)
+        if 1 <= month <= 12:
+            return month
+        raise ValueError("Numeric month must be 1-12")
+
+    if normalized in MONTH_NAME_TO_NUMBER:
+        return MONTH_NAME_TO_NUMBER[normalized]
+
+    raise ValueError(
+        "Unknown month. Use jan/january ... dec/december (or a number 1-12)."
+    )
+
+
+def prompt_for_month(default_month: int) -> int:
+    default_name = dt.date(2000, default_month, 1).strftime("%B")
+    while True:
+        answer = input(
+            f"Which month do you want to generate invoices for? "
+            f"(e.g. april/apr/4) [default: {default_name}]: "
+        ).strip()
+        if not answer:
+            return default_month
+        try:
+            return parse_month_input(answer)
+        except ValueError as exc:
+            print(f"⚠️ {exc}")
+
+
+
 def load_document(docx_path: Path):
     try:
         from docx import Document
@@ -71,7 +129,6 @@ def load_document(docx_path: Path):
             "Missing dependency 'python-docx'. Install with: pip install python-docx"
         ) from exc
     return Document(str(docx_path))
-
 
 
 def first_weekday_of_month(year: int, month: int, target_weekday: int) -> dt.date:
@@ -197,8 +254,6 @@ def update_labelled_date(document, label: str, new_date: dt.date) -> None:
         return
 
     new_text = new_date.strftime("%d/%m/%y")
-    new_text = new_date.strftime("%d/%m/%y")
-
     match = re.search(r"\d{1,2}/\d{1,2}/\d{2}", paragraph.text)
     if match:
         replace_text_in_runs(paragraph, match.group(0), new_text)
@@ -225,8 +280,6 @@ def update_description(document, month_name: str) -> None:
         return
 
     original_desc = text[content_start + 1 :].strip()
-    content_start += 1
-    original_desc = text[content_start:].strip()
     updated_desc = replace_first_word_with_month(original_desc, month_name)
     if original_desc and original_desc != updated_desc:
         replace_text_in_runs(paragraph, original_desc, updated_desc)
@@ -270,8 +323,6 @@ def set_service_dates(table, service_dates: list[dt.date]) -> float:
 
 
 def update_gst_and_total(document, subtotal: float) -> None:
-    total_value = subtotal
-
     for table in document.tables:
         for row in table.rows:
             for idx, cell in enumerate(row.cells):
@@ -344,6 +395,8 @@ def process_invoice(source_doc: Path, year: int, month: int, dry_run: bool = Fal
 
     month_abbrev = dt.date(year, month, 1).strftime("%b")
     month_name = dt.date(year, month, 1).strftime("%B")
+    previous_month_date = add_months(dt.date(year, month, 1), -1)
+    description_month_name = previous_month_date.strftime("%B")
     docx_target, pdf_target = target_names_for_month(source_doc, month_abbrev)
 
     if dry_run:
@@ -361,7 +414,7 @@ def process_invoice(source_doc: Path, year: int, month: int, dry_run: bool = Fal
     update_labelled_date(document, "date", invoice_date)
     update_labelled_date(document, "due date", due_date)
     new_invoice_number = update_invoice_number(document)
-    update_description(document, month_name)
+    update_description(document, description_month_name)
 
     service_table = find_service_table(document)
     subtotal = 0.0
@@ -433,9 +486,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--month",
-        type=int,
-        default=dt.date.today().month,
-        help="Target month number 1-12 (defaults to current month).",
+        type=str,
+        default=None,
+        help="Target month (e.g. 4, apr, april).",
     )
     parser.add_argument(
         "--dry-run",
@@ -447,22 +500,36 @@ def main() -> None:
         action="store_true",
         help="Pause at end so the window does not close immediately.",
     )
+    parser.add_argument(
+        "--ask-month",
+        action="store_true",
+        help="Prompt interactively for the target month.",
+    )
 
     args = parser.parse_args()
 
-    if not 1 <= args.month <= 12:
-        raise SystemExit("Month must be between 1 and 12")
+    default_month = dt.date.today().month
+    if args.ask_month:
+        selected_month = prompt_for_month(default_month)
+    elif args.month is None:
+        # Default behavior requested: ask on CMD when month is not explicitly passed.
+        selected_month = prompt_for_month(default_month)
+    else:
+        try:
+            selected_month = parse_month_input(args.month)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
 
     run_start = time.perf_counter()
     invoice_files = resolve_invoice_files(args.invoice_dir)
-    print_banner(args.year, args.month, args.invoice_dir, args.dry_run)
+    print_banner(args.year, selected_month, args.invoice_dir, args.dry_run)
 
     completed = 0
     failures = 0
 
     for index, source_doc in enumerate(invoice_files, start=1):
         try:
-            result = process_invoice(source_doc, args.year, args.month, dry_run=args.dry_run)
+            result = process_invoice(source_doc, args.year, selected_month, dry_run=args.dry_run)
             print_result(index, len(invoice_files), result)
             completed += 1
         except Exception as exc:  # pragma: no cover - runtime env specific
