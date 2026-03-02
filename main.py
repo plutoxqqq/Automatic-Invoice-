@@ -404,10 +404,16 @@ def process_invoice(
     config = INVOICE_RULES[customer_key]
     invoice_date = first_weekday_of_month(year, month, calendar.SUNDAY)
     due_date = get_due_date(invoice_date)
-    service_dates = all_weekdays_in_month(year, month, config.weekdays)
 
-    month_abbrev = dt.date(year, month, 1).strftime("%b")
-    previous_month_date = add_months(dt.date(year, month, 1), -1)
+    selected_month_date = dt.date(year, month, 1)
+    previous_month_date = add_months(selected_month_date, -1)
+    service_dates = all_weekdays_in_month(
+        previous_month_date.year,
+        previous_month_date.month,
+        config.weekdays,
+    )
+
+    month_abbrev = selected_month_date.strftime("%b")
     description_month_name = previous_month_date.strftime("%B")
     docx_target, pdf_target = target_names_for_month(source_doc, month_abbrev, output_dir)
 
