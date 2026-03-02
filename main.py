@@ -4,6 +4,8 @@ import argparse
 import calendar
 import datetime as dt
 import re
+import shutil
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -14,6 +16,7 @@ DEFAULT_INVOICE_DIR = Path(
     r"C:\Users\ver0016\OneDrive - Hoppers Crossing Secondary College\Desktop\Study Work\Invoices"
 )
 DEFAULT_OUTPUT_SUBFOLDER = "new invoice"
+FALLBACK_DESKTOP_FOLDER = "invoinces"
 
 
 @dataclass(frozen=True)
@@ -127,6 +130,14 @@ def load_document(docx_path: Path):
     except ImportError as exc:  # pragma: no cover - import guard
         raise SystemExit("Missing dependency 'python-docx'. Install with: pip install python-docx") from exc
     return Document(str(docx_path))
+
+
+def desktop_dir() -> Path:
+    return Path.home() / "Desktop"
+
+
+def fallback_invoice_dir() -> Path:
+    return desktop_dir() / FALLBACK_DESKTOP_FOLDER
 
 
 def first_weekday_of_month(year: int, month: int, target_weekday: int) -> dt.date:
@@ -340,20 +351,45 @@ def convert_to_pdf(docx_path: Path, pdf_path: Path) -> None:
     except ImportError:
         pass
 
-    try:
-        import win32com.client  # type: ignore
+    if sys.platform.startswith("win"):
+        try:
+            import win32com.client  # type: ignore
 
-        word = win32com.client.Dispatch("Word.Application")
-        word.Visible = False
-        document = word.Documents.Open(str(docx_path))
-        document.SaveAs(str(pdf_path), FileFormat=17)
-        document.Close()
-        word.Quit()
+            word = win32com.client.Dispatch("Word.Application")
+            word.Visible = False
+            document = word.Documents.Open(str(docx_path))
+            document.SaveAs(str(pdf_path), FileFormat=17)
+            document.Close()
+            word.Quit()
+            return
+        except Exception:
+            pass
+
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if soffice:
+        subprocess.run(
+            [
+                soffice,
+                "--headless",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                str(pdf_path.parent),
+                str(docx_path),
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        expected_pdf = pdf_path.parent / f"{docx_path.stem}.pdf"
+        if expected_pdf.exists() and expected_pdf != pdf_path:
+            expected_pdf.replace(pdf_path)
         return
-    except Exception as exc:  # pragma: no cover - runtime env specific
-        raise RuntimeError(
-            "Could not convert DOCX to PDF. Install 'docx2pdf' or ensure Word COM automation works."
-        ) from exc
+
+    raise RuntimeError(
+        "Could not convert DOCX to PDF. Install 'docx2pdf' (Mac/Windows), "
+        "or Word COM on Windows, or LibreOffice (soffice)."
+    )
 
 
 def target_names_for_month(source_path: Path, month_abbrev: str, output_dir: Path) -> tuple[Path, Path]:
@@ -387,6 +423,45 @@ def resolve_invoice_files(base_dir: Path) -> list[Path]:
         )
 
     return files
+
+
+def ensure_template_files_for_dir(base_dir: Path) -> list[Path]:
+    try:
+        return resolve_invoice_files(base_dir)
+    except SystemExit:
+        base_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            from docx import Document
+
+            for _, candidates in TEMPLATE_CANDIDATES.items():
+                target = base_dir / candidates[0]
+                if not target.exists():
+                    Document().save(str(target))
+        except ImportError:
+            for _, candidates in TEMPLATE_CANDIDATES.items():
+                target = base_dir / candidates[0]
+                if not target.exists():
+                    target.write_bytes(b"")
+        return resolve_invoice_files(base_dir)
+
+
+def pick_working_invoice_dir(initial_dir: Path) -> tuple[Path, list[Path], bool]:
+    try:
+        return initial_dir, resolve_invoice_files(initial_dir), False
+    except SystemExit:
+        fallback_dir = fallback_invoice_dir()
+        fallback_dir.mkdir(parents=True, exist_ok=True)
+
+        for _, candidates in TEMPLATE_CANDIDATES.items():
+            for name in candidates:
+                source = initial_dir / name
+                target = fallback_dir / candidates[0]
+                if source.exists() and not target.exists():
+                    shutil.copy2(source, target)
+                    break
+
+        files = ensure_template_files_for_dir(fallback_dir)
+        return fallback_dir, files, True
 
 
 def process_invoice(
@@ -542,11 +617,16 @@ def main() -> None:
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
 
-    output_dir = args.output_dir or (args.invoice_dir / DEFAULT_OUTPUT_SUBFOLDER)
+    working_invoice_dir, invoice_files, used_fallback = pick_working_invoice_dir(args.invoice_dir)
+    output_dir = args.output_dir or (working_invoice_dir / DEFAULT_OUTPUT_SUBFOLDER)
 
     run_start = time.perf_counter()
-    invoice_files = resolve_invoice_files(args.invoice_dir)
-    print_banner(args.year, selected_month, args.invoice_dir, output_dir, args.dry_run)
+    print_banner(args.year, selected_month, working_invoice_dir, output_dir, args.dry_run)
+    if used_fallback:
+        print(
+            "⚠️ Template files were not fully found in the requested folder. "
+            f"Using fallback folder: {working_invoice_dir}"
+        )
 
     completed = 0
     failures = 0
